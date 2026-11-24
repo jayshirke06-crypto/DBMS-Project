@@ -1,0 +1,228 @@
+import sqlite3
+from datetime import date, timedelta
+
+DB_FILE = "library.db"
+LOAN_DAYS = 14
+FINE_PER_DAY = 5.0  # INR per overdue day
+
+
+class LibraryDB:
+    def __init__(self, db_path: str = DB_FILE):
+        self.conn = sqlite3.connect(db_path)
+        self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA foreign_keys = ON;")
+        self._init_schema()
+
+    def _init_schema(self) -> None:
+        with self.conn:
+            self.conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS books (
+                    book_id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    isbn             TEXT UNIQUE NOT NULL,
+                    title            TEXT NOT NULL,
+                    author           TEXT NOT NULL,
+                    total_copies     INTEGER NOT NULL CHECK (total_copies >= 0),
+                    available_copies INTEGER NOT NULL CHECK (available_copies >= 0)
+                );
+
+                CREATE TABLE IF NOT EXISTS members (
+                    member_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+                    full_name  TEXT NOT NULL,
+                    email      TEXT UNIQUE NOT NULL,
+                    joined_on  DATE DEFAULT (DATE('now'))
+                );
+
+                CREATE TABLE IF NOT EXISTS transactions (
+                    txn_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                    book_id     INTEGER NOT NULL,
+                    member_id   INTEGER NOT NULL,
+                    issue_date  DATE NOT NULL,
+                    due_date    DATE NOT NULL,
+                    return_date DATE,
+                    fine_amount REAL DEFAULT 0.0,
+                    FOREIGN KEY (book_id)   REFERENCES books(book_id)   ON DELETE RESTRICT,
+                    FOREIGN KEY (member_id) REFERENCES members(member_id) ON DELETE RESTRICT
+                );
+                """
+            )
+
+    def add_book(self, isbn: str, title: str, author: str, copies: int) -> None:
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO books (isbn, title, author, total_copies, available_copies)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (isbn, title, author, copies, copies),
+            )
+
+    def search_books(self, keyword: str) -> list[sqlite3.Row]:
+        pattern = f"%{keyword}%"
+        cur = self.conn.execute(
+            """
+            SELECT book_id, isbn, title, author, available_copies, total_copies
+            FROM books
+            WHERE title LIKE ? OR author LIKE ? OR isbn LIKE ?
+            ORDER BY title
+            """,
+            (pattern, pattern, pattern),
+        )
+        return cur.fetchall()
+
+    def register_member(self, full_name: str, email: str) -> None:
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO members (full_name, email) VALUES (?, ?)",
+                (full_name, email),
+            )
+
+    def issue_book(self, book_id: int, member_id: int) -> date:
+        cur = self.conn.execute(
+            "SELECT available_copies FROM books WHERE book_id = ?", (book_id,)
+        )
+        book = cur.fetchone()
+        if not book:
+            raise ValueError("Book ID not found.")
+        if book["available_copies"] < 1:
+            raise ValueError("No copies currently available.")
+
+        today = date.today()
+        due = today + timedelta(days=LOAN_DAYS)
+
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO transactions (book_id, member_id, issue_date, due_date)
+                VALUES (?, ?, ?, ?)
+                """,
+                (book_id, member_id, today.isoformat(), due.isoformat()),
+            )
+            self.conn.execute(
+                "UPDATE books SET available_copies = available_copies - 1 WHERE book_id = ?",
+                (book_id,),
+            )
+        return due
+
+    def return_book(self, txn_id: int) -> float:
+        cur = self.conn.execute(
+            """
+            SELECT book_id, due_date, return_date
+            FROM transactions
+            WHERE txn_id = ?
+            """,
+            (txn_id,),
+        )
+        txn = cur.fetchone()
+        if not txn:
+            raise ValueError("Transaction ID not found.")
+        if txn["return_date"] is not None:
+            raise ValueError("This book has already been returned.")
+
+        today = date.today()
+        due = date.fromisoformat(txn["due_date"])
+        overdue_days = max(0, (today - due).days)
+        fine = overdue_days * FINE_PER_DAY
+
+        with self.conn:
+            self.conn.execute(
+                """
+                UPDATE transactions
+                SET return_date = ?, fine_amount = ?
+                WHERE txn_id = ?
+                """,
+                (today.isoformat(), fine, txn_id),
+            )
+            self.conn.execute(
+                "UPDATE books SET available_copies = available_copies + 1 WHERE book_id = ?",
+                (txn["book_id"],),
+            )
+        return fine
+
+    def list_active_loans(self) -> list[sqlite3.Row]:
+        cur = self.conn.execute(
+            """
+            SELECT t.txn_id, b.title, m.full_name, t.issue_date, t.due_date
+            FROM transactions t
+            INNER JOIN books b   ON t.book_id = b.book_id
+            INNER JOIN members m ON t.member_id = m.member_id
+            WHERE t.return_date IS NULL
+            ORDER BY t.due_date
+            """
+        )
+        return cur.fetchall()
+
+    def close(self) -> None:
+        self.conn.close()
+
+
+def main() -> None:
+    db = LibraryDB()
+    menu = (
+        "\n--- Library Management System ---\n"
+        "1. Add Book\n"
+        "2. Search Books\n"
+        "3. Register Member\n"
+        "4. Issue Book\n"
+        "5. Return Book\n"
+        "6. View Active Loans\n"
+        "0. Exit\n"
+    )
+
+    try:
+        while True:
+            print(menu)
+            choice = input("Select an option: ").strip()
+            try:
+                if choice == "1":
+                    isbn = input("ISBN: ").strip()
+                    title = input("Title: ").strip()
+                    author = input("Author: ").strip()
+                    copies = int(input("Total copies: ").strip())
+                    db.add_book(isbn, title, author, copies)
+                    print("Book added.")
+                elif choice == "2":
+                    keyword = input("Search (title/author/ISBN): ").strip()
+                    rows = db.search_books(keyword)
+                    for r in rows:
+                        print(
+                            f"[{r['book_id']}] {r['title']} by {r['author']} "
+                            f"(ISBN: {r['isbn']}) — {r['available_copies']}/{r['total_copies']} available"
+                        )
+                    if not rows:
+                        print("No matching books found.")
+                elif choice == "3":
+                    name = input("Full name: ").strip()
+                    email = input("Email: ").strip()
+                    db.register_member(name, email)
+                    print("Member registered.")
+                elif choice == "4":
+                    book_id = int(input("Book ID: ").strip())
+                    member_id = int(input("Member ID: ").strip())
+                    due = db.issue_book(book_id, member_id)
+                    print(f"Book issued. Due date: {due.isoformat()}")
+                elif choice == "5":
+                    txn_id = int(input("Transaction ID: ").strip())
+                    fine = db.return_book(txn_id)
+                    print(f"Book returned. Overdue fine: ₹{fine:.2f}")
+                elif choice == "6":
+                    loans = db.list_active_loans()
+                    for l in loans:
+                        print(
+                            f"Txn #{l['txn_id']} | {l['title']} -> {l['full_name']} "
+                            f"(Issued: {l['issue_date']}, Due: {l['due_date']})"
+                        )
+                    if not loans:
+                        print("No active loans.")
+                elif choice == "0":
+                    break
+                else:
+                    print("Invalid option.")
+            except (ValueError, sqlite3.Error) as exc:
+                print(f"Error: {exc}")
+    finally:
+        db.close()
+
+
+if __name__ == "__main__":
+    main()
